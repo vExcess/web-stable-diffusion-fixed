@@ -27,3 +27,32 @@ cp -r ${TOKENZIER_WASM_HOME}/pkg dist/tokenizers-wasm
 
 echo "Exporting tvmjs runtime dist files"
 python -c "from tvm.contrib import tvmjs; tvmjs.export_runtime(\"dist\")"
+
+# Chrome removed GPUAdapter.requestAdapterInfo(); prefer adapter.info.
+python - <<'PY'
+from pathlib import Path
+path = Path("dist/tvmjs.bundle.js")
+if not path.exists():
+    raise SystemExit("dist/tvmjs.bundle.js was not exported")
+text = path.read_text()
+replacements = (
+    (
+        "yield adapter.requestAdapterInfo()",
+        "adapter.info || (yield adapter.requestAdapterInfo())",
+    ),
+    (
+        "await adapter.requestAdapterInfo()",
+        "adapter.info || await adapter.requestAdapterInfo()",
+    ),
+)
+changed = False
+for old, new in replacements:
+    if old in text and new not in text:
+        text = text.replace(old, new)
+        changed = True
+if changed:
+    path.write_text(text)
+    print("Patched deprecated requestAdapterInfo usage in tvmjs.bundle.js")
+else:
+    print("tvmjs.bundle.js already uses adapter.info or has no requestAdapterInfo call")
+PY

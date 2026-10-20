@@ -326,7 +326,7 @@ class StableDiffusionPipeline {
    * async preload webgpu pipelines when possible.
    */
   async asyncLoadWebGPUPipelines() {
-    await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    await loadWebGPUPipelines(this.tvm, this.vm.getInternalModule());
   }
 
   /**
@@ -585,7 +585,7 @@ class DiffusionXLPipeline {
   }
 
   async asyncLoadWebGPUPipelines() {
-    await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    await loadWebGPUPipelines(this.tvm, this.vm.getInternalModule());
   }
 
   async generate(
@@ -732,6 +732,100 @@ class DiffusionXLPipeline {
 };
 
 /**
+ * Detect a WebGPU adapter/device without the deprecated
+ * GPUAdapter.requestAdapterInfo() method removed from current browsers.
+ */
+async function detectGPUDevice() {
+  if (typeof navigator === "undefined" || navigator.gpu === undefined) {
+    return undefined;
+  }
+
+  const adapter = await navigator.gpu.requestAdapter({
+    powerPreference: "high-performance"
+  });
+  if (adapter == null) {
+    throw Error("Cannot find adapter that matches the request");
+  }
+
+  const computeMB = (value) => {
+    return Math.ceil(value / (1 << 20)) + "MB";
+  };
+
+  let requiredMaxBufferSize = 1 << 30;
+  if (requiredMaxBufferSize > adapter.limits.maxBufferSize) {
+    requiredMaxBufferSize = 1 << 28;
+    if (requiredMaxBufferSize > adapter.limits.maxBufferSize) {
+      throw Error(
+        "Cannot initialize runtime because of requested maxBufferSize " +
+        "exceeds limit. requested=" + computeMB(requiredMaxBufferSize) +
+        ", limit=" + computeMB(adapter.limits.maxBufferSize) + "."
+      );
+    }
+  }
+
+  let requiredMaxStorageBufferBindingSize = 1 << 30;
+  if (requiredMaxStorageBufferBindingSize > adapter.limits.maxStorageBufferBindingSize) {
+    requiredMaxStorageBufferBindingSize = 1 << 27;
+    if (requiredMaxStorageBufferBindingSize > adapter.limits.maxStorageBufferBindingSize) {
+      throw Error(
+        "Cannot initialize runtime because of requested maxStorageBufferBindingSize " +
+        "exceeds limit. requested=" + computeMB(requiredMaxStorageBufferBindingSize) +
+        ", limit=" + computeMB(adapter.limits.maxStorageBufferBindingSize) + "."
+      );
+    }
+  }
+
+  const requiredMaxComputeWorkgroupStorageSize = 32 << 10;
+  if (requiredMaxComputeWorkgroupStorageSize > adapter.limits.maxComputeWorkgroupStorageSize) {
+    throw Error(
+      "Cannot initialize runtime because of requested maxComputeWorkgroupStorageSize " +
+      "exceeds limit. requested=" + requiredMaxComputeWorkgroupStorageSize +
+      ", limit=" + adapter.limits.maxComputeWorkgroupStorageSize + "."
+    );
+  }
+
+  const requiredFeatures = [];
+  if (adapter.features.has("shader-f16")) {
+    requiredFeatures.push("shader-f16");
+  }
+
+  const adapterInfo = adapter.info || (
+    typeof adapter.requestAdapterInfo === "function"
+      ? await adapter.requestAdapterInfo()
+      : { vendor: "", architecture: "", device: "", description: "" }
+  );
+
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxBufferSize: requiredMaxBufferSize,
+      maxStorageBufferBindingSize: requiredMaxStorageBufferBindingSize,
+      maxComputeWorkgroupStorageSize: requiredMaxComputeWorkgroupStorageSize,
+    },
+    requiredFeatures
+  });
+
+  return {
+    adapter: adapter,
+    adapterInfo: adapterInfo,
+    device: device
+  };
+}
+
+/**
+ * Older tvmjs bundles shipped this helper with a typo:
+ * asyncLoadWebGPUPiplines. Current TVM uses asyncLoadWebGPUPipelines.
+ */
+async function loadWebGPUPipelines(tvm, mod) {
+  if (typeof tvm.asyncLoadWebGPUPipelines === "function") {
+    await tvm.asyncLoadWebGPUPipelines(mod);
+    return;
+  }
+  if (typeof tvm.asyncLoadWebGPUPiplines === "function") {
+    await tvm.asyncLoadWebGPUPiplines(mod);
+  }
+}
+
+/**
  * A instance that can be used to facilitate deployment.
  */
 class StableDiffusionInstance {
@@ -741,7 +835,8 @@ class StableDiffusionInstance {
     this.config = undefined;
     this.generateInProgress = false;
     this.logger = console.log;
-    this.model = "Stable-Diffusion-XL"
+    const modelSelect = document.getElementById("modelId");
+    this.model = modelSelect ? modelSelect.value : "Stable-Diffusion-1.5";
   }
   /**
    * Initialize TVM
@@ -773,13 +868,16 @@ class StableDiffusionInstance {
     );
     // initialize WebGPU
     try {
-      const output = await tvmjs.detectGPUDevice();
+      const output = await detectGPUDevice();
       if (output !== undefined) {
         var label = "WebGPU";
-        if (output.adapterInfo.description.length != 0) {
-          label += " - " + output.adapterInfo.description;
-        } else {
-          label += " - " + output.adapterInfo.vendor;
+        const adapterInfo = output.adapterInfo || {};
+        const description = adapterInfo.description || "";
+        const vendor = adapterInfo.vendor || "";
+        if (description.length != 0) {
+          label += " - " + description;
+        } else if (vendor.length != 0) {
+          label += " - " + vendor;
         }
         document.getElementById(
           "gpu-tracker-label").innerHTML = ("Initialize GPU device: " + label);
@@ -827,6 +925,11 @@ class StableDiffusionInstance {
       schedulerConst.push(await (await fetch(schedulerConstUrl[i])).json())
     }
     if (this.model == "Stable-Diffusion-XL") {
+      if (!tokenizerName || !tokenizerName2) {
+        throw Error(
+          "Stable-Diffusion-XL requires tokenizer and tokenizer2 in stable-diffusion-config.json"
+        );
+      }
       const tokenizer1 = await tvmjsGlobalEnv.getTokenizer(tokenizerName);
       const tokenizer2 = await tvmjsGlobalEnv.getTokenizer(tokenizerName2);
       this.pipeline = this.tvm.withNewScope(() => {
@@ -836,6 +939,9 @@ class StableDiffusionInstance {
     }
     else {
       console.log("entered SD pipeline")
+      if (!tokenizerName) {
+        throw Error("Missing tokenizer in stable-diffusion-config.json");
+      }
       const tokenizer = await tvmjsGlobalEnv.getTokenizer(tokenizerName);
       this.pipeline = this.tvm.withNewScope(() => {
         return new StableDiffusionPipeline(this.tvm, tokenizer, schedulerConst, this.tvm.cacheMetadata);
@@ -850,15 +956,40 @@ class StableDiffusionInstance {
   async #asyncInitConfig() {
     if (this.config !== undefined) return;
     this.config = await (await fetch("stable-diffusion-config.json")).json();
-  
+
+    const hasMappedModel = (model) => {
+      return !!(
+        this.config.model_lib_map &&
+        this.config.model_lib_map[model] &&
+        this.config.param_dict &&
+        this.config.param_dict[model]
+      );
+    };
+    const hasLegacyConfig = !!(this.config.wasmUrl && this.config.cacheUrl);
+
+    if (!hasMappedModel(this.model)) {
+      if (hasLegacyConfig) {
+        this.model = "Stable-Diffusion-1.5";
+      } else if (hasMappedModel("Stable-Diffusion-1.5")) {
+        this.logger("Model " + this.model + " is unavailable; falling back to Stable-Diffusion-1.5");
+        this.model = "Stable-Diffusion-1.5";
+      }
+    }
+
+    if (!this.config.tokenizer) {
+      this.config.tokenizer = "openai/clip-vit-large-patch14";
+    }
+
     var model_param_url = undefined;
     var model_lib_url = undefined;
-    if (this.config.model_lib_map[this.model] !== undefined) {
+    if (hasMappedModel(this.model)) {
       model_param_url = this.config.param_dict[this.model];
       model_lib_url = this.config.model_lib_map[this.model];
-    }
-    else{
-      throw Error("Model not found");
+    } else if (hasLegacyConfig) {
+      model_param_url = this.config.cacheUrl;
+      model_lib_url = this.config.wasmUrl;
+    } else {
+      throw Error("Model not found: " + this.model);
     }
     this.config.wasmUrl = model_lib_url;
     this.config.cacheUrl = model_param_url;
@@ -977,6 +1108,9 @@ tvmjsGlobalEnv.asyncOnRPCServerLoad = async function (tvm) {
 
 function handle_model_change() {
   var e = document.getElementById("modelId");
+  if (!e) {
+    return;
+  }
   function onChange() {
     localStableDiffusionInst.reset();
     localStableDiffusionInst.model = e.value;

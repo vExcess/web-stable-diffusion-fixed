@@ -3,15 +3,40 @@
 </script>
 
 <script type="module">
-  import init, { TokenizerWasm } from "./dist/tokenizers-wasm/tokenizers_wasm.js";
+  import { CLIPTokenizer } from "./dist/clip_tokenizer.js";
 
-  var initialized = false;
-  async function getTokenizer(name) {
-    if (!initialized) {
-      await init();
+  async function fetchTokenizerJson(name) {
+    if (!name) {
+      throw Error("Missing tokenizer name in stable-diffusion-config.json");
     }
-    const jsonText = await (await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json")).text();
-    return new TokenizerWasm(jsonText);
+    const urls = [
+      "https://huggingface.co/" + name + "/resolve/main/tokenizer.json",
+      "https://huggingface.co/" + name + "/raw/main/tokenizer.json",
+      "dist/tokenizers/" + name + "/tokenizer.json"
+    ];
+    let lastError = null;
+    for (let i = 0; i < urls.length; ++i) {
+      try {
+        const response = await fetch(urls[i]);
+        if (!response.ok) {
+          throw Error("HTTP " + response.status + " for " + urls[i]);
+        }
+        const jsonText = await response.text();
+        JSON.parse(jsonText);
+        return jsonText;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw Error(
+      "Failed to load tokenizer.json for " + name + ": " +
+      (lastError && lastError.message ? lastError.message : String(lastError))
+    );
+  }
+
+  async function getTokenizer(name) {
+    const jsonText = await fetchTokenizerJson(name);
+    return CLIPTokenizer.fromJson(jsonText);
   }
 
   tvmjsGlobalEnv.getTokenizer = getTokenizer;
