@@ -15,6 +15,7 @@ cp web/stable_diffusion.html site/_includes
 cp web/stable_diffusion.js site/dist
 cp web/webgpu-compat.js site/dist
 cp web/clip_tokenizer.js site/dist
+cp web/model_pack.js site/dist
 
 cp dist/scheduler_pndm_consts.json site/dist
 cp dist/scheduler_dpm_solver_multistep_consts.json site/dist

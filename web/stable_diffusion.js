@@ -1066,6 +1066,9 @@ class StableDiffusionInstance {
     this.requestInProgress = true;
     try {
       await this.asyncInit();
+      if (typeof tvmjsGlobalEnv.refreshCacheStatus === "function") {
+        tvmjsGlobalEnv.refreshCacheStatus();
+      }
       const prompt = document.getElementById("inputPrompt").value;
       const negPrompt = document.getElementById("negativePrompt").value;
       const schedulerId = document.getElementById("schedulerId").value;

@@ -4,34 +4,54 @@
 
 <script type="module">
   import { CLIPTokenizer } from "./dist/clip_tokenizer.js";
+  import { exportModelCache, fetchAndCacheText, getModelCacheStatus, importModelCache } from "./dist/model_pack.js";
+
+  function uiLogger(message) {
+    console.log(message);
+    const log = document.getElementById("log");
+    if (!log) {
+      return;
+    }
+    const d = document.createElement("div");
+    d.textContent = message;
+    log.appendChild(d);
+  }
+
+  function reportCacheProgress(info) {
+    const label = document.getElementById("progress-tracker-label");
+    const bar = document.getElementById("progress-tracker-progress");
+    if (label) {
+      label.innerHTML = info.text;
+    }
+    if (bar && info.total) {
+      bar.value = (info.current / info.total) * 100;
+    }
+  }
+
+  async function refreshCacheStatus() {
+    const status = document.getElementById("model-cache-status");
+    if (!status) {
+      return;
+    }
+    try {
+      const info = await getModelCacheStatus();
+      status.textContent = info.count
+        ? ("Local model cache: " + info.count + " files. Save downloads one .tar.gz; Load that same file in the other browser.")
+        : "Local model cache: empty. Generate once to download from Hugging Face, then save the cache.";
+    } catch (err) {
+      status.textContent = "";
+    }
+  }
 
   async function fetchTokenizerJson(name) {
     if (!name) {
       throw Error("Missing tokenizer name in stable-diffusion-config.json");
     }
-    const urls = [
+    return fetchAndCacheText([
       "https://huggingface.co/" + name + "/resolve/main/tokenizer.json",
       "https://huggingface.co/" + name + "/raw/main/tokenizer.json",
       "dist/tokenizers/" + name + "/tokenizer.json"
-    ];
-    let lastError = null;
-    for (let i = 0; i < urls.length; ++i) {
-      try {
-        const response = await fetch(urls[i]);
-        if (!response.ok) {
-          throw Error("HTTP " + response.status + " for " + urls[i]);
-        }
-        const jsonText = await response.text();
-        JSON.parse(jsonText);
-        return jsonText;
-      } catch (err) {
-        lastError = err;
-      }
-    }
-    throw Error(
-      "Failed to load tokenizer.json for " + name + ": " +
-      (lastError && lastError.message ? lastError.message : String(lastError))
-    );
+    ]);
   }
 
   async function getTokenizer(name) {
@@ -40,6 +60,35 @@
   }
 
   tvmjsGlobalEnv.getTokenizer = getTokenizer;
+  tvmjsGlobalEnv.refreshCacheStatus = refreshCacheStatus;
+  tvmjsGlobalEnv.asyncOnExportModel = async function () {
+    try {
+      await exportModelCache({ logger: uiLogger, report: reportCacheProgress });
+      await refreshCacheStatus();
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        return;
+      }
+      uiLogger("Save model cache error, " + err.toString());
+    }
+  };
+  tvmjsGlobalEnv.asyncOnImportModel = async function () {
+    try {
+      await importModelCache({
+        logger: uiLogger,
+        report: reportCacheProgress,
+        filesInput: document.getElementById("modelCacheFilesInput")
+      });
+      await refreshCacheStatus();
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        return;
+      }
+      uiLogger("Load model cache error, " + err.toString());
+    }
+  };
+
+  refreshCacheStatus();
 </script>
 
 <div>
@@ -88,6 +137,10 @@
     <progress id="progress-tracker-progress" max="100" value="100"> </progress>
   </div>
   <button onclick="tvmjsGlobalEnv.asyncOnGenerate()">Generate</button>
+  <button onclick="tvmjsGlobalEnv.asyncOnExportModel()">Save model cache</button>
+  <button onclick="tvmjsGlobalEnv.asyncOnImportModel()">Load model cache</button>
+  <input id="modelCacheFilesInput" type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-tar" style="display:none" />
+  <div id="model-cache-status"></div>
 </div>
 
 <script>
