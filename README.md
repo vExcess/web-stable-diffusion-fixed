@@ -1,4 +1,5 @@
 # Web Stable Diffusion
+NOTE: Maintenance done by Grok 4.6 
 
 This project brings stable diffusion models onto web browsers. **Everything runs inside the browser with no server support.** To our knowledge, this is the world’s first stable diffusion completely running on the browser. Please checkout our [demo webpage](https://websd.mlc.ai/#text-to-image-generation-demo) to try it out.
 
