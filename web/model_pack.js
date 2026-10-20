@@ -124,13 +124,6 @@ function tarPadding(size) {
   return remainder === 0 ? 0 : 512 - remainder;
 }
 
-function concatBytes(left, right) {
-  const out = new Uint8Array(left.byteLength + right.byteLength);
-  out.set(left, 0);
-  out.set(right, left.byteLength);
-  return out;
-}
-
 function isZeroBlock(block) {
   for (let i = 0; i < block.byteLength; ++i) {
     if (block[i] !== 0) {
@@ -253,67 +246,190 @@ async function exportAsTarGzip(cache, keys, options) {
   return { entries: listed };
 }
 
-async function readExact(readerState, size) {
-  while (readerState.buffer.byteLength < size) {
-    const result = await readerState.reader.read();
-    if (result.done) {
-      if (readerState.buffer.byteLength === 0) {
-        return null;
-      }
-      throw Error("The tar archive ended unexpectedly");
-    }
-    readerState.buffer = concatBytes(readerState.buffer, result.value);
+function asUint8(value) {
+  return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
+
+async function readBytes(readerState, size) {
+  if (size === 0) {
+    return new Uint8Array(0);
   }
-  const out = readerState.buffer.subarray(0, size);
-  readerState.buffer = readerState.buffer.subarray(size);
+  const out = new Uint8Array(size);
+  let offset = 0;
+  while (offset < size) {
+    if (readerState.offset >= readerState.chunk.byteLength) {
+      const result = await readerState.reader.read();
+      if (result.done) {
+        if (offset === 0) {
+          return null;
+        }
+        throw Error("The tar archive ended unexpectedly");
+      }
+      readerState.chunk = asUint8(result.value);
+      readerState.offset = 0;
+      continue;
+    }
+    const take = Math.min(size - offset, readerState.chunk.byteLength - readerState.offset);
+    out.set(readerState.chunk.subarray(readerState.offset, readerState.offset + take), offset);
+    readerState.offset += take;
+    offset += take;
+  }
   return out;
+}
+
+async function skipBytes(readerState, size) {
+  let remaining = size;
+  while (remaining > 0) {
+    if (readerState.offset >= readerState.chunk.byteLength) {
+      const result = await readerState.reader.read();
+      if (result.done) {
+        throw Error("The tar archive ended unexpectedly");
+      }
+      readerState.chunk = asUint8(result.value);
+      readerState.offset = 0;
+      continue;
+    }
+    const take = Math.min(remaining, readerState.chunk.byteLength - readerState.offset);
+    readerState.offset += take;
+    remaining -= take;
+  }
+}
+
+function entryLookupNames(entry) {
+  const names = [];
+  if (entry && entry.file) {
+    names.push(entry.file);
+    names.push(entry.file.split("/").pop());
+  }
+  return names;
 }
 
 async function importFromTarStream(stream, options) {
   const readerState = {
     reader: stream.getReader(),
-    buffer: new Uint8Array(0)
+    chunk: new Uint8Array(0),
+    offset: 0
   };
-  const files = Object.create(null);
-  while (true) {
-    const header = await readExact(readerState, 512);
-    if (!header || isZeroBlock(header)) {
-      break;
+  const logger = (options && options.logger) || defaultLogger;
+  const report = options && options.report;
+  const pending = Object.create(null);
+  let expected = 0;
+  let loaded = 0;
+  let sawManifest = false;
+  let cache = null;
+
+  reportProgress(report, 0, 1, "Reading model cache archive...");
+
+  try {
+    while (true) {
+      const header = await readBytes(readerState, 512);
+      if (!header || isZeroBlock(header)) {
+        break;
+      }
+      const name = readCString(header, 0, 100);
+      const prefix = readCString(header, 345, 155);
+      const fullName = prefix ? prefix + "/" + name : name;
+      const size = parseInt(readCString(header, 124, 12), 8) || 0;
+      const typeFlag = header[156];
+      const pad = tarPadding(size);
+      const isFile = typeFlag === 0 || typeFlag === 0x30;
+
+      if (!isFile) {
+        if (size) {
+          await skipBytes(readerState, size);
+        }
+        if (pad) {
+          await skipBytes(readerState, pad);
+        }
+        continue;
+      }
+
+      if (fullName === "manifest.json" || name === "manifest.json") {
+        const data = await readBytes(readerState, size);
+        if (pad) {
+          await skipBytes(readerState, pad);
+        }
+        const manifest = JSON.parse(new TextDecoder().decode(data));
+        if (!manifest || manifest.format !== FORMAT || !Array.isArray(manifest.entries)) {
+          throw Error("The archive is not a Web Stable Diffusion model cache.");
+        }
+        expected = manifest.entries.length;
+        for (let i = 0; i < manifest.entries.length; ++i) {
+          const entry = manifest.entries[i];
+          const names = entryLookupNames(entry);
+          for (let j = 0; j < names.length; ++j) {
+            pending[names[j]] = entry;
+          }
+        }
+        sawManifest = true;
+        cache = await caches.open(CACHE_SCOPE);
+        reportProgress(report, 0, expected || 1, "Found " + expected + " cached files");
+        continue;
+      }
+
+      if (!sawManifest) {
+        throw Error("The archive is missing manifest.json.");
+      }
+
+      const entry = pending[fullName] || pending[name] || pending[fullName.split("/").pop()];
+      if (!entry) {
+        if (size) {
+          await skipBytes(readerState, size);
+        }
+        if (pad) {
+          await skipBytes(readerState, pad);
+        }
+        continue;
+      }
+
+      reportProgress(report, loaded, expected || 1, "Loading " + (entry.file || entry.url));
+      const data = size ? await readBytes(readerState, size) : new Uint8Array(0);
+      if (pad) {
+        await skipBytes(readerState, pad);
+      }
+      await cache.put(
+        new Request(entry.url),
+        new Response(data, {
+          headers: {
+            "Content-Type": entry.contentType || "application/octet-stream"
+          }
+        })
+      );
+      loaded += 1;
+      const names = entryLookupNames(entry);
+      for (let i = 0; i < names.length; ++i) {
+        delete pending[names[i]];
+      }
     }
-    const name = readCString(header, 0, 100);
-    const prefix = readCString(header, 345, 155);
-    const fullName = prefix ? prefix + "/" + name : name;
-    const size = parseInt(readCString(header, 124, 12), 8) || 0;
-    const data = size ? await readExact(readerState, size) : new Uint8Array(0);
-    const pad = tarPadding(size);
-    if (pad) {
-      await readExact(readerState, pad);
+  } finally {
+    try {
+      readerState.reader.releaseLock();
+    } catch (err) {
+      // The stream may already be closed after a full read.
     }
-    files[fullName] = data;
   }
 
-  const manifestBytes = files["manifest.json"];
-  if (!manifestBytes) {
+  if (!sawManifest) {
     throw Error("The archive is missing manifest.json.");
   }
-  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
-  if (!manifest || manifest.format !== FORMAT || !Array.isArray(manifest.entries)) {
-    throw Error("The archive is not a Web Stable Diffusion model cache.");
+  if (loaded !== expected) {
+    throw Error("The archive is missing packed files (" + loaded + " of " + expected + " loaded).");
   }
-  await importEntries(manifest.entries, function (relativePath) {
-    const data = files[relativePath] || files[relativePath.split("/").pop()];
-    if (!data) {
-      throw Error("Missing packed file: " + relativePath);
-    }
-    return data.slice().buffer;
-  }, options);
+  logger("Loaded " + loaded + " cached model files. Generate will use this local cache.");
+}
+
+function fileStream(file) {
+  if (typeof file.stream === "function") {
+    return file.stream();
+  }
+  return new Blob([file]).stream();
 }
 
 async function importFromTar(file, options) {
   const name = file.name || "";
   const sniff = new Uint8Array(await file.slice(0, 2).arrayBuffer());
-  const isGzip = sniff[0] === 0x1f && sniff[1] === 0x8b;
-  let stream = file.stream();
+  const isGzip = sniff.length >= 2 && sniff[0] === 0x1f && sniff[1] === 0x8b;
+  let stream = fileStream(file);
   if (isGzip || /\.tgz$|\.tar\.gz$/i.test(name)) {
     if (typeof DecompressionStream !== "function") {
       throw Error("This browser cannot decompress .tar.gz. Use Firefox or Chrome 113+.");
@@ -338,38 +454,40 @@ export async function exportModelCache(options) {
   return exportAsTarGzip(cache, keys, options);
 }
 
-async function importEntries(entries, readFile, options) {
-  const logger = (options && options.logger) || defaultLogger;
-  const report = options && options.report;
-  const cache = await caches.open(CACHE_SCOPE);
-  for (let i = 0; i < entries.length; ++i) {
-    const entry = entries[i];
-    reportProgress(report, i, entries.length, "Loading " + (entry.file || entry.url));
-    const data = await readFile(entry.file);
-    await cache.put(
-      new Request(entry.url),
-      new Response(data, {
-        headers: {
-          "Content-Type": entry.contentType || "application/octet-stream"
-        }
-      })
-    );
-  }
-  logger("Loaded " + entries.length + " cached model files. Generate will use this local cache.");
-}
-
 function chooseFiles(fileInput) {
   return new Promise(function (resolve, reject) {
     if (!fileInput) {
       reject(Error("Choose the downloaded web-sd-model-cache.tar.gz file."));
       return;
     }
-    const onChange = function () {
+    const cleanup = function () {
       fileInput.removeEventListener("change", onChange);
-      resolve(fileInput.files);
+      fileInput.removeEventListener("cancel", onCancel);
     };
-    fileInput.addEventListener("change", onChange);
+    const onChange = function () {
+      cleanup();
+      const files = fileInput.files;
+      if (!files || files.length === 0) {
+        reject(Object.assign(new Error("Cancelled"), { name: "AbortError" }));
+        return;
+      }
+      resolve(files);
+    };
+    const onCancel = function () {
+      cleanup();
+      reject(Object.assign(new Error("Cancelled"), { name: "AbortError" }));
+    };
     fileInput.value = "";
+    fileInput.addEventListener("change", onChange);
+    fileInput.addEventListener("cancel", onCancel);
+    if (typeof fileInput.showPicker === "function") {
+      try {
+        fileInput.showPicker();
+        return;
+      } catch (err) {
+        // Some browsers only allow showPicker in a narrower gesture than click().
+      }
+    }
     fileInput.click();
   });
 }
@@ -383,14 +501,19 @@ export async function importModelCache(options) {
   if (typeof caches === "undefined") {
     throw Error("This browser does not expose a Cache API to import");
   }
-  const fileInput = options.filesInput || options.fileInput;
-  const files = await chooseFiles(fileInput);
+  const logger = options.logger || defaultLogger;
+  let files = options.files;
+  if (!files || files.length === 0) {
+    files = await chooseFiles(options.filesInput || options.fileInput);
+  }
   if (!files || files.length !== 1) {
     throw Error("Choose one web-sd-model-cache.tar.gz (or .tar) file.");
   }
   const file = files[0];
-  if (!isTarName(file.name) && file.type !== "application/gzip" && file.type !== "application/x-tar") {
+  if (!isTarName(file.name) && file.type !== "application/gzip" && file.type !== "application/x-tar" && file.type !== "application/x-gzip") {
     throw Error("The cache must be a .tar.gz or .tar file.");
   }
+  reportProgress(options.report, 0, 1, "Opening " + (file.name || "archive") + "...");
+  logger("Reading " + (file.name || "archive") + " (" + file.size + " bytes)...");
   await importFromTar(file, options);
 }

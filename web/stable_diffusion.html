@@ -72,12 +72,12 @@
       uiLogger("Save model cache error, " + err.toString());
     }
   };
-  tvmjsGlobalEnv.asyncOnImportModel = async function () {
+  async function loadSelectedCache(files) {
     try {
       await importModelCache({
+        files: files,
         logger: uiLogger,
-        report: reportCacheProgress,
-        filesInput: document.getElementById("modelCacheFilesInput")
+        report: reportCacheProgress
       });
       await refreshCacheStatus();
     } catch (err) {
@@ -86,6 +86,34 @@
       }
       uiLogger("Load model cache error, " + err.toString());
     }
+  }
+
+  const cacheFileInput = document.getElementById("modelCacheFilesInput");
+  if (cacheFileInput) {
+    cacheFileInput.addEventListener("change", function () {
+      if (!cacheFileInput.files || cacheFileInput.files.length === 0) {
+        return;
+      }
+      loadSelectedCache(cacheFileInput.files);
+    });
+  }
+
+  tvmjsGlobalEnv.asyncOnImportModel = async function () {
+    const input = document.getElementById("modelCacheFilesInput");
+    if (!input) {
+      uiLogger("Load model cache error, file picker is missing.");
+      return;
+    }
+    input.value = "";
+    if (typeof input.showPicker === "function") {
+      try {
+        input.showPicker();
+        return;
+      } catch (err) {
+        // Fall back to input.click() when showPicker is blocked.
+      }
+    }
+    input.click();
   };
 
   refreshCacheStatus();
@@ -136,10 +164,10 @@
     <label id="progress-tracker-label"></label><br>
     <progress id="progress-tracker-progress" max="100" value="100"> </progress>
   </div>
-  <button onclick="tvmjsGlobalEnv.asyncOnGenerate()">Generate</button>
-  <button onclick="tvmjsGlobalEnv.asyncOnExportModel()">Save model cache</button>
-  <button onclick="tvmjsGlobalEnv.asyncOnImportModel()">Load model cache</button>
-  <input id="modelCacheFilesInput" type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-tar" style="display:none" />
+  <button type="button" onclick="tvmjsGlobalEnv.asyncOnGenerate()">Generate</button>
+  <button type="button" onclick="tvmjsGlobalEnv.asyncOnExportModel()">Save model cache</button>
+  <button type="button" onclick="tvmjsGlobalEnv.asyncOnImportModel()">Load model cache</button>
+  <input id="modelCacheFilesInput" type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-gzip,application/x-tar" style="position:absolute;width:1px;height:1px;padding:0;border:0;overflow:hidden;clip:rect(0,0,0,0)" />
   <div id="model-cache-status"></div>
 </div>
 

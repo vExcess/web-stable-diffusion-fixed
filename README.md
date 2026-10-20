@@ -1,5 +1,15 @@
 # Web Stable Diffusion
-NOTE: Maintenance done by Grok 4.6 
+
+## START NOTE
+All changes from the original done by Grok 4.6 
+
+Changes
+1) Rewrote sections to use the 2026 WebGPU API instead of the obsolete 2023 WebGPU API
+2) Added support for downloading the model cache to a .tar.gz and reuploading it so the user doesn't have to redownload it from hugging face.
+
+Self host the demo by running `./scripts/serve_local_demo.sh`
+
+## END NOTE
 
 This project brings stable diffusion models onto web browsers. **Everything runs inside the browser with no server support.** To our knowledge, this is the world’s first stable diffusion completely running on the browser. Please checkout our [demo webpage](https://websd.mlc.ai/#text-to-image-generation-demo) to try it out.
 
